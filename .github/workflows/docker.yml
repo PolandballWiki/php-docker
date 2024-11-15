@@ -30,7 +30,6 @@ jobs:
         with:
           filters: |
             8.1: ['dockerfiles/php-base/8.1/**']
-            # Add more PHP versions as needed
 
       - name: Determine if workflow should run
         id: check_run
@@ -67,6 +66,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Extract PHP version from Dockerfile
+        id: php_version
+        run: |
+          DOCKERFILE="./dockerfiles/php-base/${{ matrix.php.version }}/Dockerfile"
+          # Extract the full version from the FROM instruction (assumes format like php:8.1.30-fpm-alpine)
+          FULL_VERSION=$(grep '^FROM php:' "$DOCKERFILE" | sed -E 's/FROM php:([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          MAJOR_MINOR=$(echo "$FULL_VERSION" | cut -d. -f1,2)
+          PATCH_VERSION=$(echo "$FULL_VERSION" | cut -d. -f3)
+          
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          echo "major_minor=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+          echo "patch_version=$PATCH_VERSION" >> $GITHUB_OUTPUT
+          
+          echo "Detected versions:"
+          echo "Full version: $FULL_VERSION"
+          echo "Major.Minor: $MAJOR_MINOR"
+          echo "Patch: $PATCH_VERSION"
+
       - name: Check if Dockerfile changed
         id: check_version
         run: |
@@ -87,8 +104,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ matrix.php.version }}
-            type=raw,value=${{ matrix.php.version }}-${{ github.run_number }}
+            type=raw,value=${{ steps.php_version.outputs.major_minor }}
+            type=raw,value=${{ steps.php_version.outputs.major_minor }}-${{ github.run_number }}
 
       - name: Set up Docker Buildx
         if: steps.check_version.outputs.should_build == 'true'
@@ -119,19 +136,24 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.php.suffix }}-${{ matrix.os.cache_id }}
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.php.suffix }}-${{ matrix.os.cache_id }},mode=max
 
-      - name: Export digests
+      - name: Export digests and metadata
         if: steps.check_version.outputs.should_build == 'true'
         run: |
           mkdir -p /tmp/digests
+          # Save digest
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+          # Save version metadata
+          echo "${{ steps.php_version.outputs.major_minor }}" > /tmp/digests/major_minor
+          echo "${{ steps.php_version.outputs.patch_version }}" > /tmp/digests/patch_version
+          echo "${{ steps.php_version.outputs.full_version }}" > /tmp/digests/full_version
 
       - name: Upload digests
         if: steps.check_version.outputs.should_build == 'true'
         uses: actions/upload-artifact@v3
         with:
           name: digests-${{ matrix.php.version }}
-          path: /tmp/digests/*
+          path: /tmp/digests/
           if-no-files-found: error
           retention-days: 1
 
@@ -149,22 +171,26 @@ jobs:
         with:
           path: /tmp/digests-all
 
-      - name: Merge digest files
+      - name: Merge digest files and extract versions
+        id: versions
         run: |
           mkdir -p /tmp/digests
+          # Get version info from first artifact (they should all be the same version)
+          MAJOR_MINOR=$(cat $(find /tmp/digests-all -name major_minor | head -n1))
+          PATCH_VERSION=$(cat $(find /tmp/digests-all -name patch_version | head -n1))
+          FULL_VERSION=$(cat $(find /tmp/digests-all -name full_version | head -n1))
+          
+          echo "major_minor=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+          echo "patch_version=$PATCH_VERSION" >> $GITHUB_OUTPUT
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          
+          # Copy digests
           for dir in /tmp/digests-all/*; do
             if [ -d "$dir" ]; then
-              cp $dir/* /tmp/digests/
+              # Only copy SHA256 digest files, not the version metadata
+              find "$dir" -type f -not -name "major_minor" -not -name "patch_version" -not -name "full_version" -exec cp {} /tmp/digests/ \;
             fi
           done
-
-      # Get PHP version from artifact name for tagging
-      - name: Extract PHP version
-        id: php_version
-        run: |
-          VERSION=$(ls /tmp/digests-all/ | head -n1 | cut -d'-' -f2)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Found PHP version: $VERSION"
 
       - name: Docker meta
         id: meta
@@ -173,8 +199,10 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.php_version.outputs.version }}
-            type=raw,value=${{ steps.php_version.outputs.version }}-${{ github.run_number }}
+            type=raw,value=${{ steps.versions.outputs.major_minor }}
+            type=raw,value=${{ steps.versions.outputs.major_minor }}-${{ github.run_number }}
+            type=raw,value=${{ steps.versions.outputs.full_version }}
+            type=raw,value=${{ steps.versions.outputs.full_version }}-${{ github.run_number }}
   
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
