@@ -1,0 +1,125 @@
+name: Build and push PHP base image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/polandballwiki/php-base
+
+jobs:
+  build:
+    name: Build PHP Base Image (${{ matrix.php.version }}, ${{ matrix.os.prettyname }})
+    runs-on: ${{ matrix.os.fullname }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php:
+          - { version: "8.1", suffix: "php81" }
+        os:
+          - { prettyname: Linux AMD64, fullname: ubuntu-22.04, platform: linux/amd64, cache_id: linux-amd64 }
+          - { prettyname: Linux ARM64, fullname: ubuntu-22.04, platform: linux/arm64, cache_id: linux-arm64 }
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ matrix.php.version }}
+            type=raw,value=${{ matrix.php.version }}-${{ github.run_number }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        if: matrix.os.platform == 'linux/arm64'
+   
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: ./dockerfiles/php-base/${{ matrix.php.version }}
+          file: ./dockerfiles/php-base/${{ matrix.php.version }}/Dockerfile
+          platforms: ${{ matrix.os.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.php.suffix }}-${{ matrix.os.cache_id }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.php.suffix }}-${{ matrix.os.cache_id }},mode=max
+
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge digests
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
+            type=raw,value=${{ matrix.php.version }}-latest${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
+            type=raw,value=${{ matrix.php.version }}-${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
+            type=raw,value=${{ matrix.php.version }}-${{ github.run_number }}
+  
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+  
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} 
