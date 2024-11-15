@@ -4,14 +4,52 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'dockerfiles/php-base/**'  # Only trigger on Dockerfile changes
   workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/polandballwiki/php-base
 
 jobs:
+  changes:
+    name: Detect changed PHP versions
+    runs-on: ubuntu-latest
+    outputs:
+      php_versions: ${{ steps.filter.outputs.changes }}
+      should_run: ${{ steps.check_run.outputs.should_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Needed for file comparison
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            8.1: ['dockerfiles/php-base/8.1/**']
+            # Add more PHP versions as needed
+
+      - name: Determine if workflow should run
+        id: check_run
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "${{ steps.filter.outputs.changes }}" != "[]" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+            
+      - name: List detected changes
+        run: |
+          echo "Changed PHP versions: ${{ steps.filter.outputs.changes }}"
+          echo "Should run: ${{ steps.check_run.outputs.should_run }}"
+
   build:
     name: Build PHP Base Image (${{ matrix.php.version }}, ${{ matrix.os.prettyname }})
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
     runs-on: ${{ matrix.os.fullname }}
     strategy:
       fail-fast: false
@@ -29,8 +67,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Check if Dockerfile changed
+        id: check_version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            if echo "${{ needs.changes.outputs.php_versions }}" | jq -e 'contains(["${{ matrix.php.version }}"])' > /dev/null; then
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
       - name: Docker meta
         id: meta
+        if: steps.check_version.outputs.should_build == 'true'
         uses: docker/metadata-action@v4
         with:
           images: ${{ env.IMAGE_NAME }}
@@ -39,13 +91,15 @@ jobs:
             type=raw,value=${{ matrix.php.version }}-${{ github.run_number }}
 
       - name: Set up Docker Buildx
+        if: steps.check_version.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v2
 
       - name: Set up QEMU
+        if: matrix.os.platform == 'linux/arm64' && steps.check_version.outputs.should_build == 'true'
         uses: docker/setup-qemu-action@v2
-        if: matrix.os.platform == 'linux/arm64'
    
       - name: Login to GitHub Container Registry
+        if: steps.check_version.outputs.should_build == 'true'
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
@@ -54,6 +108,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
+        if: steps.check_version.outputs.should_build == 'true'
         uses: docker/build-push-action@v4
         with:
           context: ./dockerfiles/php-base/${{ matrix.php.version }}
@@ -65,15 +120,17 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.php.suffix }}-${{ matrix.os.cache_id }},mode=max
 
       - name: Export digests
+        if: steps.check_version.outputs.should_build == 'true'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digests
+        if: steps.check_version.outputs.should_build == 'true'
         uses: actions/upload-artifact@v3
         with:
-          name: digests
+          name: digests-${{ matrix.php.version }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -81,17 +138,33 @@ jobs:
   merge:
     name: Merge digests
     runs-on: ubuntu-22.04
+    needs: [changes, build]
+    if: needs.changes.outputs.should_run == 'true'
     permissions:
       contents: read
       packages: write
-    needs:
-      - build
     steps:
-      - name: Download digests
+      - name: Download all digests
         uses: actions/download-artifact@v3
         with:
-          name: digests
-          path: /tmp/digests
+          path: /tmp/digests-all
+
+      - name: Merge digest files
+        run: |
+          mkdir -p /tmp/digests
+          for dir in /tmp/digests-all/*; do
+            if [ -d "$dir" ]; then
+              cp $dir/* /tmp/digests/
+            fi
+          done
+
+      # Get PHP version from artifact name for tagging
+      - name: Extract PHP version
+        id: php_version
+        run: |
+          VERSION=$(ls /tmp/digests-all/ | head -n1 | cut -d'-' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Found PHP version: $VERSION"
 
       - name: Docker meta
         id: meta
@@ -99,10 +172,9 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
-            type=raw,value=${{ matrix.php.version }}-latest${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
-            type=raw,value=${{ matrix.php.version }}-${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
-            type=raw,value=${{ matrix.php.version }}-${{ github.run_number }}
+            type=raw,value=latest
+            type=raw,value=${{ steps.php_version.outputs.version }}
+            type=raw,value=${{ steps.php_version.outputs.version }}-${{ github.run_number }}
   
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -122,4 +194,4 @@ jobs:
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} 
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
