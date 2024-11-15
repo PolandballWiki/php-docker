@@ -30,6 +30,8 @@ jobs:
         with:
           filters: |
             8.1: ['dockerfiles/php-base/8.1/**']
+            8.3: ['dockerfiles/php-base/8.3/**']
+            # Add more PHP versions as needed
 
       - name: Determine if workflow should run
         id: check_run
@@ -55,6 +57,7 @@ jobs:
       matrix:
         php:
           - { version: "8.1", suffix: "php81" }
+          - { version: "8.3", suffix: "php83" }
         os:
           - { prettyname: Linux AMD64, fullname: ubuntu-22.04, platform: linux/amd64, cache_id: linux-amd64 }
           - { prettyname: Linux ARM64, fullname: ubuntu-22.04, platform: linux/arm64, cache_id: linux-arm64 }
@@ -87,10 +90,13 @@ jobs:
       - name: Check if Dockerfile changed
         id: check_version
         run: |
+          echo "Event type: ${{ github.event_name }}"
+          echo "Changes output: ${{ needs.changes.outputs.php_versions }}"
+          echo "Matrix version: ${{ matrix.php.version }}"
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
-            if echo "${{ needs.changes.outputs.php_versions }}" | jq -e 'contains(["${{ matrix.php.version }}"])' > /dev/null; then
+            if echo '${{ needs.changes.outputs.php_versions }}' | jq -e 'contains(["${{ matrix.php.version }}"])' > /dev/null; then
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
               echo "should_build=false" >> $GITHUB_OUTPUT
