@@ -14,6 +14,7 @@ RUN set -eux; \
 		git \
 		imagemagick \
 		python3 \
+		py3-yaml \
 		vips-tools \
 	;
 
