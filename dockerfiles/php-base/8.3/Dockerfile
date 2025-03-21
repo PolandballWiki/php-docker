@@ -1,5 +1,5 @@
 # Base image with PHP extensions and Composer
-FROM php:8.3.13-fpm-alpine AS php-base
+FROM php:8.3.19-fpm-alpine AS php-base
 
 # System dependencies
 RUN set -eux; \
