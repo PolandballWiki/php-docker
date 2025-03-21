@@ -61,4 +61,3 @@ RUN php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" \
 
 # Entry point
 CMD ["php-fpm"]
-
