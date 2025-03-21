@@ -106,29 +106,29 @@ jobs:
       - name: Docker meta
         id: meta
         if: steps.check_version.outputs.should_build == 'true'
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ steps.php_version.outputs.major_minor }}
             type=raw,value=${{ steps.php_version.outputs.major_minor }}-${{ github.run_number }}
 
-      - name: Set up Docker Buildx
-        if: steps.check_version.outputs.should_build == 'true'
-        uses: docker/setup-buildx-action@v2
-
       - name: Login to GitHub Container Registry
         if: steps.check_version.outputs.should_build == 'true'
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        if: steps.check_version.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push by digest
         id: build
         if: steps.check_version.outputs.should_build == 'true'
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v6
         with:
           context: ./dockerfiles/php-base/${{ matrix.php.version }}
           file: ./dockerfiles/php-base/${{ matrix.php.version }}/Dockerfile
@@ -141,27 +141,27 @@ jobs:
       - name: Export digests and metadata
         if: steps.check_version.outputs.should_build == 'true'
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p ${{ runner.temp }}/digests
           # Save digest
           digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
           # Save version metadata
-          echo "${{ steps.php_version.outputs.major_minor }}" > /tmp/digests/major_minor
-          echo "${{ steps.php_version.outputs.patch_version }}" > /tmp/digests/patch_version
-          echo "${{ steps.php_version.outputs.full_version }}" > /tmp/digests/full_version
+          echo "${{ steps.php_version.outputs.major_minor }}" > ${{ runner.temp }}/digests/major_minor
+          echo "${{ steps.php_version.outputs.patch_version }}" > ${{ runner.temp }}/digests/patch_version
+          echo "${{ steps.php_version.outputs.full_version }}" > ${{ runner.temp }}/digests/full_version
 
       - name: Upload digests
         if: steps.check_version.outputs.should_build == 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.php.version }}
-          path: /tmp/digests/
+          name: digests-${{ matrix.php.version }}-${{ matrix.os.cache_id }}
+          path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     name: Merge digests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: [changes, build]
     if: needs.changes.outputs.should_run == 'true'
     permissions:
@@ -169,34 +169,35 @@ jobs:
       packages: write
     steps:
       - name: Download all digests
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests-all
+          path: ${{ runner.temp }}/digests-all
+          pattern: digests-*
 
       - name: Merge digest files and extract versions
         id: versions
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p ${{ runner.temp }}/digests
           # Get version info from first artifact (they should all be the same version)
-          MAJOR_MINOR=$(cat $(find /tmp/digests-all -name major_minor | head -n1))
-          PATCH_VERSION=$(cat $(find /tmp/digests-all -name patch_version | head -n1))
-          FULL_VERSION=$(cat $(find /tmp/digests-all -name full_version | head -n1))
+          MAJOR_MINOR=$(cat $(find ${{ runner.temp }}/digests-all -name major_minor | head -n1))
+          PATCH_VERSION=$(cat $(find ${{ runner.temp }}/digests-all -name patch_version | head -n1))
+          FULL_VERSION=$(cat $(find ${{ runner.temp }}/digests-all -name full_version | head -n1))
           
           echo "major_minor=$MAJOR_MINOR" >> $GITHUB_OUTPUT
           echo "patch_version=$PATCH_VERSION" >> $GITHUB_OUTPUT
           echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
           
           # Copy digests
-          for dir in /tmp/digests-all/*; do
+          for dir in ${{ runner.temp }}/digests-all/*; do
             if [ -d "$dir" ]; then
               # Only copy SHA256 digest files, not the version metadata
-              find "$dir" -type f -not -name "major_minor" -not -name "patch_version" -not -name "full_version" -exec cp {} /tmp/digests/ \;
+              find "$dir" -type f -not -name "major_minor" -not -name "patch_version" -not -name "full_version" -exec cp {} ${{ runner.temp }}/digests/ \;
             fi
           done
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -207,20 +208,22 @@ jobs:
             type=raw,value=${{ steps.versions.outputs.full_version }}-${{ github.run_number }}
   
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
   
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
+        working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          set -ex
+          docker buildx imagetools create \
+            $(echo '${{ steps.meta.outputs.json }}' | jq -cr '.tags | map("-t " + .) | join(" ")') \
+            $(ls -A | xargs -I{} echo -n "${{ env.IMAGE_NAME }}@sha256:{} ")
 
       - name: Inspect image
         run: |
